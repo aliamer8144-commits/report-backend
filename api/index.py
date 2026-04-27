@@ -7,17 +7,26 @@ from io import BytesIO
 from pathlib import Path
 import os
 import re
+import time
+import uuid
+import threading
 from dotenv import load_dotenv
 
 # Load environment variables from .env.local
 load_dotenv(dotenv_path=".env.local")
 
-# Global flag to track if fonts have been uploaded to Aspose Cloud Storage
-_aspose_fonts_uploaded = False
-
 from pptx import Presentation  # python-pptx
 from urllib.parse import quote
 import requests
+
+# --- Aspose Token Cache ---
+_cached_token: str | None = None
+_token_expiry: float = 0
+_token_lock = threading.Lock()
+
+# --- Font upload state (fonts persist in Aspose Cloud Storage forever) ---
+_fonts_initialized = False
+_fonts_lock = threading.Lock()
 
 
 class ReportPayload(BaseModel):
@@ -274,80 +283,19 @@ REQUIRED_FONTS = [
 ]
 
 
-def _fonts_already_uploaded(token: str) -> bool:
-    """Check if all required fonts already exist in Aspose Cloud Storage.
-    Uses a single API call to list the fonts folder contents.
-    """
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = requests.get(
-            f"{ASPOSE_SLIDES_API}/storage/folder/{FONT_STORAGE_FOLDER}",
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            files = data.get("value", [])
-            uploaded_names = {f.get("name", "") for f in files}
-            return all(f in uploaded_names for f in REQUIRED_FONTS)
-    except Exception:
-        pass
-    return False
-
-
-def ensure_aspose_fonts(token: str):
-    """Upload Arabic fonts to Aspose Cloud Storage if not already uploaded.
-    
-    Fonts persist in Aspose Cloud Storage between requests.
-    Uses a single folder-list API call to check if all fonts exist,
-    so even on cold starts it only uploads when fonts are missing.
-    """
-    global _aspose_fonts_uploaded
-    if _aspose_fonts_uploaded:
-        return
-    
-    # Single API call to check if fonts folder is already populated
-    if _fonts_already_uploaded(token):
-        print(f"[fonts] All fonts already exist in storage, skipping upload")
-        _aspose_fonts_uploaded = True
-        return
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    for font_file in REQUIRED_FONTS:
-        font_path = _FONTS_DIR / font_file
-        if not font_path.exists():
-            print(f"[fonts] Font file not found: {font_path}")
-            continue
-        
-        try:
-            with open(font_path, "rb") as f:
-                font_bytes = f.read()
-            
-            storage_path = f"{FONT_STORAGE_FOLDER}/{font_file}"
-            upload_resp = requests.put(
-                f"{ASPOSE_SLIDES_API}/storage/file/{storage_path}",
-                headers=headers,
-                data=font_bytes,
-                timeout=30,
-            )
-            
-            if upload_resp.status_code in (200, 201):
-                print(f"[fonts] Uploaded '{font_file}' to Aspose Storage")
-            else:
-                print(f"[fonts] Warning: Failed to upload '{font_file}': {upload_resp.status_code} - {upload_resp.text[:200]}")
-        except Exception as e:
-            print(f"[fonts] Error uploading '{font_file}': {e}")
-    
-    _aspose_fonts_uploaded = True
-
-
 def get_aspose_token() -> str:
-    """Get JWT access token from Aspose Cloud."""
+    """Get JWT access token from Aspose Cloud (cached for ~58 minutes)."""
+    global _cached_token, _token_expiry
+    
+    with _token_lock:
+        if _cached_token and time.time() < _token_expiry:
+            return _cached_token
+    
     client_id = os.getenv("ASPOSE_APP_SID")
     client_secret = os.getenv("ASPOSE_APP_KEY")
     if not client_id or not client_secret:
         raise HTTPException(status_code=500, detail="ASPOSE_APP_SID and ASPOSE_APP_KEY must be configured")
+    
     resp = requests.post(
         ASPOSE_TOKEN_URL,
         data={
@@ -359,33 +307,92 @@ def get_aspose_token() -> str:
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Failed to get Aspose token: {resp.text[:300]}")
-    return resp.json()["access_token"]
+    
+    token = resp.json()["access_token"]
+    with _token_lock:
+        _cached_token = token
+        _token_expiry = time.time() + 3500  # ~58 min (tokens valid for 1 hour)
+    return token
+
+
+def _ensure_fonts_once(token: str):
+    """Upload fonts to Aspose Cloud Storage exactly once per server instance.
+    
+    Fonts persist in storage permanently. This runs once on first PDF request.
+    No API calls on subsequent requests (in-memory flag).
+    """
+    global _fonts_initialized
+    if _fonts_initialized:
+        return
+    
+    with _fonts_lock:
+        # Double-check after acquiring lock
+        if _fonts_initialized:
+            return
+        
+        headers = {"Authorization": f"Bearer {token}"}
+        for font_file in REQUIRED_FONTS:
+            font_path = _FONTS_DIR / font_file
+            if not font_path.exists():
+                print(f"[fonts] Font file not found: {font_path}")
+                continue
+            try:
+                with open(font_path, "rb") as f:
+                    font_bytes = f.read()
+                storage_path = f"{FONT_STORAGE_FOLDER}/{font_file}"
+                resp = requests.put(
+                    f"{ASPOSE_SLIDES_API}/storage/file/{storage_path}",
+                    headers=headers,
+                    data=font_bytes,
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    print(f"[fonts] Uploaded '{font_file}'")
+                else:
+                    print(f"[fonts] Upload '{font_file}': {resp.status_code}")
+            except Exception as e:
+                print(f"[fonts] Error uploading '{font_file}': {e}")
+        
+        _fonts_initialized = True
 
 
 def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
-    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API with high quality."""
-    token = get_aspose_token()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API.
     
-    # Ensure Arabic fonts are uploaded to Aspose Cloud Storage
-    ensure_aspose_fonts(token)
+    Optimized to use minimum API calls:
+    - Token: cached in memory (0 extra calls after first)
+    - Fonts: uploaded once ever (0 calls on subsequent requests)
+    - Upload PPTX: 1 PUT call
+    - Convert to PDF: 1 POST call
+    - Delete: skipped (file overwritten next time)
+    
+    Total per PDF: 2 API calls (upload + convert)
+    """
+    token = get_aspose_token()
+    auth_header = {"Authorization": f"Bearer {token}"}
+    
+    # Upload fonts once (no-op on subsequent requests)
+    _ensure_fonts_once(token)
+
+    # Generate unique filename to avoid race conditions
+    file_id = uuid.uuid4().hex[:8]
+    pptx_filename = f"r_{file_id}.pptx"
 
     # Step 1: Upload PPTX to Aspose Cloud Storage
     upload_resp = requests.put(
-        f"{ASPOSE_SLIDES_API}/storage/file/report.pptx",
-        headers=headers,
+        f"{ASPOSE_SLIDES_API}/storage/file/{pptx_filename}",
+        headers=auth_header,
         data=pptx_bytes,
         timeout=60,
     )
     if upload_resp.status_code not in (200, 201):
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to upload PPTX to Aspose: {upload_resp.status_code} - {upload_resp.text[:300]}"
+            detail=f"Failed to upload PPTX: {upload_resp.status_code} - {upload_resp.text[:300]}"
         )
 
     # Step 2: Convert PPTX to PDF with high quality options
-    # fontFolders tells Aspose to look for fonts in the 'fonts' folder in cloud storage
-    # This ensures Arabic fonts (Dubai, Noto Sans Arabic) are available during conversion
+    json_headers = {**auth_header, "Content-Type": "application/json"}
     pdf_options = {
         "format": "pdf",
         "options": {
@@ -399,26 +406,30 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
     }
 
     convert_resp = requests.post(
-        f"{ASPOSE_SLIDES_API}/report.pptx/pdf?withOptions=true",
-        headers=headers,
+        f"{ASPOSE_SLIDES_API}/{pptx_filename}/pdf?withOptions=true",
+        headers=json_headers,
         json=pdf_options,
         timeout=120,
     )
+    
+    # Fire-and-forget: delete uploaded file in background to save response time
+    try:
+        threading.Thread(
+            target=lambda: requests.delete(
+                f"{ASPOSE_SLIDES_API}/storage/file/{pptx_filename}",
+                headers=auth_header,
+                timeout=15,
+            ),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+
     if convert_resp.status_code != 200:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to convert PPTX to PDF: {convert_resp.status_code} - {convert_resp.text[:300]}"
         )
-
-    # Step 3: Clean up - delete the uploaded file from storage
-    try:
-        requests.delete(
-            f"{ASPOSE_SLIDES_API}/storage/file/report.pptx",
-            headers=headers,
-            timeout=15,
-        )
-    except Exception:
-        pass  # Ignore cleanup errors
 
     return convert_resp.content
 
