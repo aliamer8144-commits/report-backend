@@ -254,7 +254,71 @@ def generate_pptx(payload: ReportPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-SLIDIZE_CONVERT_URL = "https://api.slidize.cloud/v1.0/slides/convert/pdf"
+ASPOSE_TOKEN_URL = "https://api.aspose.cloud/connect/token"
+ASPOSE_SLIDES_API = "https://api.aspose.cloud/v3.0/slides"
+
+
+def get_aspose_token() -> str:
+    """Get JWT access token from Aspose Cloud."""
+    client_id = os.getenv("ASPOSE_APP_SID")
+    client_secret = os.getenv("ASPOSE_APP_KEY")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="ASPOSE_APP_SID and ASPOSE_APP_KEY must be configured")
+    resp = requests.post(
+        ASPOSE_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Failed to get Aspose token: {resp.text[:300]}")
+    return resp.json()["access_token"]
+
+
+def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
+    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API."""
+    token = get_aspose_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Step 1: Upload PPTX to Aspose Cloud Storage
+    upload_resp = requests.put(
+        f"{ASPOSE_SLIDES_API}/storage/file/report.pptx",
+        headers=headers,
+        data=pptx_bytes,
+        timeout=60,
+    )
+    if upload_resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload PPTX to Aspose: {upload_resp.status_code} - {upload_resp.text[:300]}"
+        )
+
+    # Step 2: Convert PPTX to PDF
+    convert_resp = requests.post(
+        f"{ASPOSE_SLIDES_API}/report.pptx/pdf",
+        headers=headers,
+        timeout=120,
+    )
+    if convert_resp.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to convert PPTX to PDF: {convert_resp.status_code} - {convert_resp.text[:300]}"
+        )
+
+    # Step 3: Clean up - delete the uploaded file from storage
+    try:
+        requests.delete(
+            f"{ASPOSE_SLIDES_API}/storage/file/report.pptx",
+            headers=headers,
+            timeout=15,
+        )
+    except Exception:
+        pass  # Ignore cleanup errors
+
+    return convert_resp.content
 
 
 @app.post("/generate-pdf")
@@ -292,20 +356,8 @@ def generate_pdf(payload: ReportPayload):
         prs.save(pptx_buf)
         pptx_buf.seek(0)
 
-        # Convert PPTX -> PDF using Slidize Cloud API (free, no auth required)
-        try:
-            slidize_resp = requests.post(
-                SLIDIZE_CONVERT_URL,
-                files={"documents": ("report.pptx", pptx_buf, "application/vnd.openxmlformats-officedocument.presentationml.presentation")},
-                timeout=120,
-            )
-            if slidize_resp.status_code != 200:
-                raise RuntimeError(
-                    f"Slidize Cloud API returned status {slidize_resp.status_code}: {slidize_resp.text[:500]}"
-                )
-            pdf_bytes = slidize_resp.content
-        except requests.RequestException as e:
-            raise HTTPException(status_code=500, detail=f"Error calling Slidize Cloud API: {str(e)}")
+        # Convert PPTX -> PDF using Aspose.Slides Cloud API (high quality)
+        pdf_bytes = convert_pptx_to_pdf_with_aspose(pptx_buf.getvalue())
 
         filename = "sickLeaves.pdf"
         ascii_fallback = "sickLeaves.pdf"
