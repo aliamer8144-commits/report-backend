@@ -8,7 +8,7 @@ from pathlib import Path
 import os
 import re
 import time
-import uuid
+import json
 import threading
 from dotenv import load_dotenv
 
@@ -349,71 +349,46 @@ def _ensure_fonts_once(token: str):
 def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
     """Convert PPTX bytes to PDF using Aspose.Slides Cloud API.
     
-    Optimized to use minimum API calls:
-    - Token: cached in memory (0 extra calls after first)
-    - Fonts: uploaded once ever (0 calls on subsequent requests)
-    - Upload PPTX: 1 PUT call
-    - Convert to PDF: 1 POST call
-    - Delete: fire-and-forget in background thread
+    Uses the direct conversion endpoint (POST /convert/pdf) which accepts
+    the PPTX file in the request body and returns the PDF directly.
     
-    Total per PDF: 2 API calls (upload + convert)
+    This is exactly 1 API call per PDF (no upload/delete to storage needed).
+    Fonts must already exist in Aspose Cloud Storage (uploaded once).
     """
     token = get_aspose_token()
-    auth_header = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}"}
     
-    # Upload fonts once (no-op on subsequent requests)
+    # Upload fonts once to storage (only on first-ever request)
     _ensure_fonts_once(token)
 
-    # Generate unique filename to avoid race conditions
-    file_id = uuid.uuid4().hex[:8]
-    pptx_filename = f"r_{file_id}.pptx"
-
-    # Step 1: Upload PPTX to Aspose Cloud Storage
-    upload_resp = requests.put(
-        f"{ASPOSE_SLIDES_API}/storage/file/{pptx_filename}",
-        headers=auth_header,
-        data=pptx_bytes,
-        timeout=60,
-    )
-    if upload_resp.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to upload PPTX: {upload_resp.status_code} - {upload_resp.text[:300]}"
-        )
-
-    # Step 2: Convert PPTX to PDF with high quality options
-    json_headers = {**auth_header, "Content-Type": "application/json"}
+    # PDF export options for high quality Arabic text
     pdf_options = {
-        "format": "pdf",
-        "options": {
-            "jpegQuality": 100,
-            "sufficientResolution": 300,
-            "embedFullFonts": True,
-            "saveMetafilesAsPng": True,
-            "drawSlidesFrame": False,
-            "fontFolders": [FONT_STORAGE_FOLDER],
-        }
+        "EmbedFullFonts": True,
+        "JpegQuality": 100,
+        "SufficientResolution": 300.0,
+        "SaveMetafilesAsPng": True,
+        "DrawSlidesFrame": False,
+        "RasterizeUnsupportedFontStyles": True,
+    }
+
+    # Single API call: direct PPTX → PDF conversion
+    # fontsFolder tells Aspose to look for custom fonts in cloud storage
+    multipart_data = {
+        "document": (
+            "report.pptx",
+            pptx_bytes,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        "options": (None, json.dumps(pdf_options), "application/json"),
     }
 
     convert_resp = requests.post(
-        f"{ASPOSE_SLIDES_API}/{pptx_filename}/pdf?withOptions=true",
-        headers=json_headers,
-        json=pdf_options,
+        f"{ASPOSE_SLIDES_API}/convert/pdf",
+        params={"fontsFolder": FONT_STORAGE_FOLDER},
+        headers=headers,
+        files=multipart_data,
         timeout=120,
     )
-    
-    # Fire-and-forget: delete uploaded file in background
-    try:
-        threading.Thread(
-            target=lambda: requests.delete(
-                f"{ASPOSE_SLIDES_API}/storage/file/{pptx_filename}",
-                headers=auth_header,
-                timeout=15,
-            ),
-            daemon=True,
-        ).start()
-    except Exception:
-        pass
 
     if convert_resp.status_code != 200:
         raise HTTPException(
