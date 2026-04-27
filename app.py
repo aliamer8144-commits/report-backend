@@ -142,17 +142,18 @@ def replace_placeholders(prs: Presentation, mapping: dict):
                 continue
 
 
+# Font substitution mapping for PDF generation
+ARABIC_FONT_SUBSTITUTES = {
+    "Dubai": "Cairo",
+    "Tahoma": "Noto Sans Arabic",
+}
+
+
 def substitute_arabic_fonts_for_pdf(prs: Presentation):
-    """Replace Dubai and Tahoma fonts with Noto Sans Arabic for Arabic text runs.
+    """Replace Arabic font references with full-coverage equivalents for PDF generation.
     
-    This is used ONLY for PDF generation because:
-    - The PPTX template has embedded font SUBSETS for Dubai/Tahoma
-    - When new Arabic text is inserted, characters may not be in the subset
-    - Noto Sans Arabic has full Arabic glyph coverage
-    - We have a valid full NotoSansArabic-Regular.ttf uploaded to Aspose Cloud Storage
-    
-    This function creates in-place modifications to the presentation object.
-    The original PPTX generation path is NOT affected.
+    This is used ONLY for PDF generation. The PPTX download is unaffected.
+    Dubai → Cairo, Tahoma → Noto Sans Arabic (both from Google Fonts, full Arabic coverage).
     """
     for slide in prs.slides:
         for shape in slide.shapes:
@@ -162,10 +163,9 @@ def substitute_arabic_fonts_for_pdf(prs: Presentation):
                         for run in paragraph.runs:
                             font_name = run.font.name
                             text = run.text or ""
-                            # Check if text contains Arabic characters
                             has_arabic = any('\u0600' <= c <= '\u06FF' for c in text)
-                            if font_name in ("Dubai", "Tahoma") and has_arabic:
-                                run.font.name = "Noto Sans Arabic"
+                            if font_name in ARABIC_FONT_SUBSTITUTES and has_arabic:
+                                run.font.name = ARABIC_FONT_SUBSTITUTES[font_name]
             except Exception:
                 continue
 
@@ -282,13 +282,14 @@ ASPOSE_TOKEN_URL = "https://api.aspose.cloud/connect/token"
 ASPOSE_SLIDES_API = "https://api.aspose.cloud/v3.0/slides"
 
 # Font files directory - uploaded to Aspose Cloud Storage for PPTX→PDF conversion
-# These fonts are needed because Aspose Cloud servers don't have Arabic fonts like Dubai
+# Cairo replaces Dubai, Noto Sans Arabic replaces Tahoma (both full Arabic coverage)
 _FONTS_DIR = Path(__file__).resolve().parent / "api" / "fonts"
 FONT_STORAGE_FOLDER = "fonts"
 REQUIRED_FONTS = [
-    "Dubai-Regular.ttf",
-    "Dubai-Bold.ttf",
+    "Cairo-Regular.ttf",
+    "Cairo-Bold.ttf",
     "NotoSansArabic-Regular.ttf",
+    "NotoSansArabic-Bold.ttf",
 ]
 
 
