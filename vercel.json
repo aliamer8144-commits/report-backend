@@ -5,7 +5,7 @@
       "src": "api/index.py",
       "use": "@vercel/python",
       "config": {
-        "includeFiles": "public/templates/**"
+        "includeFiles": ["public/templates/**", "api/fonts/**"]
       }
     }
   ],

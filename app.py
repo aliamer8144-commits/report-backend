@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 # Load environment variables from .env.local
 load_dotenv(dotenv_path=".env.local")
 
+# Global flag to track if fonts have been uploaded to Aspose Cloud Storage
+_aspose_fonts_uploaded = False
+
 from pptx import Presentation  # python-pptx
 from urllib.parse import quote
 import requests
@@ -250,6 +253,58 @@ def generate_pptx(payload: ReportPayload):
 ASPOSE_TOKEN_URL = "https://api.aspose.cloud/connect/token"
 ASPOSE_SLIDES_API = "https://api.aspose.cloud/v3.0/slides"
 
+# Font files directory - uploaded to Aspose Cloud Storage for PPTX→PDF conversion
+# These fonts are needed because Aspose Cloud servers don't have Arabic fonts like Dubai
+_FONTS_DIR = Path(__file__).resolve().parent / "api" / "fonts"
+FONT_STORAGE_FOLDER = "fonts"
+REQUIRED_FONTS = [
+    "Dubai-Regular.ttf",
+    "Dubai-Bold.ttf",
+    "NotoSansArabic-Regular.ttf",
+]
+
+
+def ensure_aspose_fonts(token: str):
+    """Upload Arabic fonts to Aspose Cloud Storage if not already uploaded.
+    
+    Fonts persist in Aspose Cloud Storage between requests.
+    This function uploads them once per cold start to ensure they're available
+    for PPTX→PDF conversion via the fontFolders option.
+    """
+    global _aspose_fonts_uploaded
+    if _aspose_fonts_uploaded:
+        return
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    for font_file in REQUIRED_FONTS:
+        font_path = _FONTS_DIR / font_file
+        if not font_path.exists():
+            print(f"[fonts] Font file not found: {font_path}")
+            continue
+        
+        try:
+            with open(font_path, "rb") as f:
+                font_bytes = f.read()
+            
+            # Upload font to Aspose Cloud Storage
+            storage_path = f"{FONT_STORAGE_FOLDER}/{font_file}"
+            upload_resp = requests.put(
+                f"{ASPOSE_SLIDES_API}/storage/file/{storage_path}",
+                headers=headers,
+                data=font_bytes,
+                timeout=30,
+            )
+            
+            if upload_resp.status_code in (200, 201):
+                print(f"[fonts] Uploaded '{font_file}' to Aspose Storage")
+            else:
+                print(f"[fonts] Warning: Failed to upload '{font_file}': {upload_resp.status_code} - {upload_resp.text[:200]}")
+        except Exception as e:
+            print(f"[fonts] Error uploading '{font_file}': {e}")
+    
+    _aspose_fonts_uploaded = True
+
 
 def get_aspose_token() -> str:
     """Get JWT access token from Aspose Cloud."""
@@ -275,6 +330,9 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
     """Convert PPTX bytes to PDF using Aspose.Slides Cloud API with high quality."""
     token = get_aspose_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    # Ensure Arabic fonts are uploaded to Aspose Cloud Storage
+    ensure_aspose_fonts(token)
 
     # Step 1: Upload PPTX to Aspose Cloud Storage
     upload_resp = requests.put(
@@ -290,6 +348,8 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
         )
 
     # Step 2: Convert PPTX to PDF with high quality options
+    # fontFolders tells Aspose to look for fonts in the 'fonts' folder in cloud storage
+    # This ensures Arabic fonts (Dubai, Noto Sans Arabic) are available during conversion
     pdf_options = {
         "format": "pdf",
         "options": {
@@ -298,6 +358,7 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
             "embedFullFonts": True,
             "saveMetafilesAsPng": True,
             "drawSlidesFrame": False,
+            "fontFolders": [FONT_STORAGE_FOLDER],
         }
     }
 
