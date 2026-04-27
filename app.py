@@ -142,34 +142,6 @@ def replace_placeholders(prs: Presentation, mapping: dict):
                 continue
 
 
-# Font substitution mapping for PDF generation
-ARABIC_FONT_SUBSTITUTES = {
-    "Dubai": "Cairo",
-    "Tahoma": "Noto Sans Arabic",
-}
-
-
-def substitute_arabic_fonts_for_pdf(prs: Presentation):
-    """Replace Arabic font references with full-coverage equivalents for PDF generation.
-    
-    This is used ONLY for PDF generation. The PPTX download is unaffected.
-    Dubai → Cairo, Tahoma → Noto Sans Arabic (both from Google Fonts, full Arabic coverage).
-    """
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            try:
-                if hasattr(shape, "text_frame") and shape.has_text_frame:
-                    for paragraph in shape.text_frame.paragraphs:
-                        for run in paragraph.runs:
-                            font_name = run.font.name
-                            text = run.text or ""
-                            has_arabic = any('\u0600' <= c <= '\u06FF' for c in text)
-                            if font_name in ARABIC_FONT_SUBSTITUTES and has_arabic:
-                                run.font.name = ARABIC_FONT_SUBSTITUTES[font_name]
-            except Exception:
-                continue
-
-
 app = FastAPI(title="PPTX Generator Service")
 
 app.add_middleware(
@@ -286,10 +258,10 @@ ASPOSE_SLIDES_API = "https://api.aspose.cloud/v3.0/slides"
 _FONTS_DIR = Path(__file__).resolve().parent / "api" / "fonts"
 FONT_STORAGE_FOLDER = "fonts"
 REQUIRED_FONTS = [
-    "Cairo-Regular.ttf",
-    "Cairo-Bold.ttf",
-    "NotoSansArabic-Regular.ttf",
-    "NotoSansArabic-Bold.ttf",
+    "Dubai-Regular.ttf",
+    "Dubai-Bold.ttf",
+    "Tahoma-Regular.ttf",
+    "Tahoma-Bold.ttf",
 ]
 
 
@@ -445,11 +417,6 @@ def generate_pdf(payload: ReportPayload):
         }
 
         replace_placeholders(prs, mapping)
-
-        # Substitute Arabic fonts (Dubai/Tahoma → Noto Sans Arabic) for PDF generation
-        # This ensures all Arabic characters render correctly since the template's
-        # embedded font subsets may not contain all needed Arabic glyphs
-        substitute_arabic_fonts_for_pdf(prs)
 
         # Save filled PPTX to in-memory buffer
         pptx_buf = BytesIO()
