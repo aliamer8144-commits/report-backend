@@ -142,6 +142,34 @@ def replace_placeholders(prs: Presentation, mapping: dict):
                 continue
 
 
+def substitute_arabic_fonts_for_pdf(prs: Presentation):
+    """Replace Dubai and Tahoma fonts with Noto Sans Arabic for Arabic text runs.
+    
+    This is used ONLY for PDF generation because:
+    - The PPTX template has embedded font SUBSETS for Dubai/Tahoma
+    - When new Arabic text is inserted, characters may not be in the subset
+    - Noto Sans Arabic has full Arabic glyph coverage
+    - We have a valid full NotoSansArabic-Regular.ttf uploaded to Aspose Cloud Storage
+    
+    This function creates in-place modifications to the presentation object.
+    The original PPTX generation path is NOT affected.
+    """
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            try:
+                if hasattr(shape, "text_frame") and shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        for run in paragraph.runs:
+                            font_name = run.font.name
+                            text = run.text or ""
+                            # Check if text contains Arabic characters
+                            has_arabic = any('\u0600' <= c <= '\u06FF' for c in text)
+                            if font_name in ("Dubai", "Tahoma") and has_arabic:
+                                run.font.name = "Noto Sans Arabic"
+            except Exception:
+                continue
+
+
 app = FastAPI(title="PPTX Generator Service")
 
 app.add_middleware(
@@ -416,6 +444,11 @@ def generate_pdf(payload: ReportPayload):
         }
 
         replace_placeholders(prs, mapping)
+
+        # Substitute Arabic fonts (Dubai/Tahoma → Noto Sans Arabic) for PDF generation
+        # This ensures all Arabic characters render correctly since the template's
+        # embedded font subsets may not contain all needed Arabic glyphs
+        substitute_arabic_fonts_for_pdf(prs)
 
         # Save filled PPTX to in-memory buffer
         pptx_buf = BytesIO()
