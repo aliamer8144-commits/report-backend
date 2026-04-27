@@ -9,7 +9,6 @@ import os
 import re
 import time
 import json
-import threading
 from dotenv import load_dotenv
 
 # Load environment variables from .env.local
@@ -22,11 +21,6 @@ import requests
 # --- Aspose Token Cache ---
 _cached_token: str | None = None
 _token_expiry: float = 0
-_token_lock = threading.Lock()
-
-# --- Font upload state (fonts persist in Aspose Cloud Storage forever) ---
-_fonts_initialized = False
-_fonts_lock = threading.Lock()
 
 
 class ReportPayload(BaseModel):
@@ -269,27 +263,15 @@ def generate_pptx(payload: ReportPayload):
 ASPOSE_TOKEN_URL = "https://api.aspose.cloud/connect/token"
 ASPOSE_SLIDES_API = "https://api.aspose.cloud/v3.0/slides"
 
-# Font files directory - uploaded to Aspose Cloud Storage for PPTX→PDF conversion
-# These are full-coverage Arabic fonts (renamed from Google Fonts) that replace the
-# template's embedded font subsets. Aspose automatically matches fonts by internal name.
-# Dubai → renamed Tajawal, Tahoma → renamed Noto Sans Arabic (255 Arabic glyphs)
-_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
-FONT_STORAGE_FOLDER = "fonts"
-REQUIRED_FONTS = [
-    "Dubai-Regular.ttf",
-    "Dubai-Bold.ttf",
-    "Tahoma-Regular.ttf",
-    "Tahoma-Bold.ttf",
-]
+
 
 
 def get_aspose_token() -> str:
     """Get JWT access token from Aspose Cloud (cached for ~58 minutes)."""
     global _cached_token, _token_expiry
     
-    with _token_lock:
-        if _cached_token and time.time() < _token_expiry:
-            return _cached_token
+    if _cached_token and time.time() < _token_expiry:
+        return _cached_token
     
     client_id = os.getenv("ASPOSE_APP_SID")
     client_secret = os.getenv("ASPOSE_APP_KEY")
@@ -309,80 +291,28 @@ def get_aspose_token() -> str:
         raise HTTPException(status_code=500, detail=f"Failed to get Aspose token: {resp.text[:300]}")
     
     token = resp.json()["access_token"]
-    with _token_lock:
-        _cached_token = token
-        _token_expiry = time.time() + 3500  # ~58 min (tokens valid for 1 hour)
+    _cached_token = token
+    _token_expiry = time.time() + 3500  # ~58 min
     return token
-
-
-def _ensure_fonts_once(token: str):
-    """Upload fonts to Aspose Cloud Storage exactly once per server instance.
-    
-    Fonts persist in storage permanently. This runs once on first PDF request.
-    No API calls on subsequent requests (in-memory flag).
-    """
-    global _fonts_initialized
-    if _fonts_initialized:
-        return
-    
-    with _fonts_lock:
-        # Double-check after acquiring lock
-        if _fonts_initialized:
-            return
-        
-        headers = {"Authorization": f"Bearer {token}"}
-        for font_file in REQUIRED_FONTS:
-            font_path = _FONTS_DIR / font_file
-            if not font_path.exists():
-                print(f"[fonts] Font file not found: {font_path}")
-                continue
-            try:
-                with open(font_path, "rb") as f:
-                    font_bytes = f.read()
-                storage_path = f"{FONT_STORAGE_FOLDER}/{font_file}"
-                resp = requests.put(
-                    f"{ASPOSE_SLIDES_API}/storage/file/{storage_path}",
-                    headers=headers,
-                    data=font_bytes,
-                    timeout=30,
-                )
-                if resp.status_code in (200, 201):
-                    print(f"[fonts] Uploaded '{font_file}'")
-                else:
-                    print(f"[fonts] Upload '{font_file}': {resp.status_code}")
-            except Exception as e:
-                print(f"[fonts] Error uploading '{font_file}': {e}")
-        
-        _fonts_initialized = True
 
 
 def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
     """Convert PPTX bytes to PDF using Aspose.Slides Cloud API.
     
-    Uses the direct conversion endpoint (POST /convert/pdf) which accepts
-    the PPTX file in the request body and returns the PDF directly.
-    
-    This is exactly 1 API call per PDF (no upload/delete to storage needed).
-    Fonts must already exist in Aspose Cloud Storage (uploaded once).
+    Uses the direct conversion endpoint - exactly 1 API call.
+    Fonts are embedded in the PPTX template (Embed all characters).
     """
     token = get_aspose_token()
     headers = {"Authorization": f"Bearer {token}"}
-    
-    # Upload fonts once to storage (only on first-ever request)
-    _ensure_fonts_once(token)
 
-    # PDF export options for high quality Arabic text
     pdf_options = {
         "EmbedFullFonts": True,
         "JpegQuality": 100,
         "SufficientResolution": 300.0,
         "SaveMetafilesAsPng": True,
         "DrawSlidesFrame": False,
-        "RasterizeUnsupportedFontStyles": True,
     }
 
-    # Single API call: direct PPTX → PDF conversion
-    # fontsFolder tells Aspose to look for custom fonts in cloud storage
     multipart_data = {
         "document": (
             "report.pptx",
@@ -394,7 +324,6 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
 
     convert_resp = requests.post(
         f"{ASPOSE_SLIDES_API}/convert/pdf",
-        params={"fontsFolder": FONT_STORAGE_FOLDER},
         headers=headers,
         files=multipart_data,
         timeout=120,
