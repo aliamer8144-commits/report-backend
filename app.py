@@ -272,9 +272,9 @@ def get_aspose_token() -> str:
 
 
 def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
-    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API."""
+    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API with high quality."""
     token = get_aspose_token()
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     # Step 1: Upload PPTX to Aspose Cloud Storage
     upload_resp = requests.put(
@@ -289,10 +289,22 @@ def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
             detail=f"Failed to upload PPTX to Aspose: {upload_resp.status_code} - {upload_resp.text[:300]}"
         )
 
-    # Step 2: Convert PPTX to PDF
+    # Step 2: Convert PPTX to PDF with high quality options
+    pdf_options = {
+        "format": "pdf",
+        "options": {
+            "jpegQuality": 100,
+            "sufficientResolution": 300,
+            "embedFullFonts": True,
+            "saveMetafilesAsPng": True,
+            "drawSlidesFrame": False,
+        }
+    }
+
     convert_resp = requests.post(
-        f"{ASPOSE_SLIDES_API}/report.pptx/pdf",
+        f"{ASPOSE_SLIDES_API}/report.pptx/pdf?withOptions=true",
         headers=headers,
+        json=pdf_options,
         timeout=120,
     )
     if convert_resp.status_code != 200:
