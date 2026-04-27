@@ -265,15 +265,42 @@ REQUIRED_FONTS = [
 ]
 
 
+def _fonts_already_uploaded(token: str) -> bool:
+    """Check if all required fonts already exist in Aspose Cloud Storage.
+    Uses a single API call to list the fonts folder contents.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = requests.get(
+            f"{ASPOSE_SLIDES_API}/storage/folder/{FONT_STORAGE_FOLDER}",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            files = data.get("value", [])
+            uploaded_names = {f.get("name", "") for f in files}
+            return all(f in uploaded_names for f in REQUIRED_FONTS)
+    except Exception:
+        pass
+    return False
+
+
 def ensure_aspose_fonts(token: str):
     """Upload Arabic fonts to Aspose Cloud Storage if not already uploaded.
     
     Fonts persist in Aspose Cloud Storage between requests.
-    This function uploads them once per cold start to ensure they're available
-    for PPTX→PDF conversion via the fontFolders option.
+    Uses a single folder-list API call to check if all fonts exist,
+    so even on cold starts it only uploads when fonts are missing.
     """
     global _aspose_fonts_uploaded
     if _aspose_fonts_uploaded:
+        return
+    
+    # Single API call to check if fonts folder is already populated
+    if _fonts_already_uploaded(token):
+        print(f"[fonts] All fonts already exist in storage, skipping upload")
+        _aspose_fonts_uploaded = True
         return
     
     headers = {"Authorization": f"Bearer {token}"}
@@ -288,7 +315,6 @@ def ensure_aspose_fonts(token: str):
             with open(font_path, "rb") as f:
                 font_bytes = f.read()
             
-            # Upload font to Aspose Cloud Storage
             storage_path = f"{FONT_STORAGE_FOLDER}/{font_file}"
             upload_resp = requests.put(
                 f"{ASPOSE_SLIDES_API}/storage/file/{storage_path}",
