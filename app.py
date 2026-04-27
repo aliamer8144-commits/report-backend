@@ -285,12 +285,34 @@ def get_aspose_token() -> str:
     return _cached_token
 
 
+def log_api_usage(usage_type: str, status: str, details: str | None = None):
+    """Log API usage to Supabase for admin dashboard tracking."""
+    try:
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not supabase_url or not supabase_key:
+            return  # Skip logging if Supabase not configured
+        
+        requests.post(
+            f"{supabase_url}/rest/v1/api_usage_logs",
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={
+                "type": usage_type,
+                "status": status,
+                "details": details,
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[log_api_usage] Failed to log: {e}")
+
+
 def convert_pptx_to_pdf_with_aspose(pptx_bytes: bytes) -> bytes:
-    """Convert PPTX bytes to PDF using Aspose.Slides Cloud API.
-    
-    Uses the direct conversion endpoint - exactly 1 API call.
-    Fonts are embedded in the PPTX template (Embed all characters).
-    """
     token = get_aspose_token()
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -373,13 +395,17 @@ def generate_pdf(payload: ReportPayload):
             media_type="application/pdf",
             headers={"Content-Disposition": cd},
         )
-    except HTTPException:
+    except HTTPException as he:
+        log_api_usage("pdf", "error", str(he.detail)[:200])
         raise
     except Exception as e:
         import traceback
         print("[generate-pdf] Error:", e)
         traceback.print_exc()
+        log_api_usage("pdf", "error", str(e)[:200])
         raise HTTPException(status_code=500, detail=str(e))
+    else:
+        log_api_usage("pdf", "success")
 
 
 if __name__ == "__main__":
