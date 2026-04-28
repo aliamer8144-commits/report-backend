@@ -17,6 +17,86 @@ load_dotenv(dotenv_path=".env.local")
 from pptx import Presentation  # python-pptx
 from urllib.parse import quote
 import requests
+import zipfile
+import io
+
+
+# --- Font injection for subset fonts fix ---
+_FONT_REPLACEMENTS = {
+    "Dubai": {
+        "regular": "fonts/Dubai-Regular.ttf",
+        "bold": "fonts/Dubai-Bold.ttf",
+    },
+    "Noto Sans Arabic": {
+        "regular": "fonts/NotoSansArabic-Regular.ttf",
+        "bold": "fonts/NotoSansArabic-Bold.ttf",
+    },
+}
+
+
+def _get_font_dir() -> Path:
+    candidates = [Path("api/fonts"), Path("fonts"), Path.cwd() / "api/fonts", Path.cwd() / "fonts"]
+    for c in candidates:
+        if c.is_dir() and any(c.glob("*.ttf")):
+            return c
+    return candidates[0]
+
+
+def inject_full_fonts(pptx_bytes: bytes) -> bytes:
+    """Replace subset embedded fonts with full TTF fonts in the PPTX."""
+    font_dir = _get_font_dir()
+    buf = io.BytesIO()
+    
+    with zipfile.ZipFile(io.BytesIO(pptx_bytes), 'r') as zin:
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+            rels_content = ""
+            for name in zin.namelist():
+                if name == "ppt/_rels/presentation.xml.rels":
+                    rels_content = zin.read(name).decode('utf-8', errors='ignore')
+                    break
+            
+            rid_to_target = {}
+            if rels_content:
+                for m in re.findall(r'Id="(rId\d+)"[^>]*Target="(fonts/[^"\\]+\.fntdata)"', rels_content):
+                    rid_to_target[m[0]] = m[1]
+            
+            pres_content = ""
+            for name in zin.namelist():
+                if name == "ppt/presentation.xml":
+                    pres_content = zin.read(name).decode('utf-8', errors='ignore')
+                    break
+            
+            font_file_map = {}
+            if pres_content and '<p:embeddedFontLst>' in pres_content:
+                embed_section = pres_content[pres_content.index('<p:embeddedFontLst>'):pres_content.index('</p:embeddedFontLst>')]
+                blocks = re.findall(r'<p:embeddedFont>(.*?)</p:embeddedFont>', embed_section, re.DOTALL)
+                for block in blocks:
+                    typeface_match = re.search(r'typeface="([^"]+)"', block)
+                    if not typeface_match:
+                        continue
+                    typeface = typeface_match.group(1)
+                    for style, rid in re.findall(r'<p:(\w+)\s+r:id="(rId\d+)"', block):
+                        target = rid_to_target.get(rid)
+                        if target:
+                            font_file_map[(typeface, style)] = target
+            
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.startswith("ppt/fonts/") and item.filename.endswith(".fntdata"):
+                    filename = item.filename.split("/")[-1]
+                    for (typeface, style), target in font_file_map.items():
+                        if target.endswith(filename) and typeface in _FONT_REPLACEMENTS:
+                            font_style_key = style if style in ("regular", "bold") else "regular"
+                            ttf_name = _FONT_REPLACEMENTS[typeface].get(font_style_key)
+                            if ttf_name:
+                                ttf_path = font_dir / ttf_name.split("/")[-1]
+                                if ttf_path.exists():
+                                    data = ttf_path.read_bytes()
+                                    print(f"[inject_fonts] Replaced {filename} ({len(data):,}B)")
+                zout.writestr(item, data)
+    
+    buf.seek(0)
+    return buf.getvalue()
 
 # --- Aspose Token Cache ---
 _cached_token: str | None = None
@@ -382,10 +462,13 @@ def generate_pdf(payload: ReportPayload):
         # Save filled PPTX to in-memory buffer
         pptx_buf = BytesIO()
         prs.save(pptx_buf)
-        pptx_buf.seek(0)
+        pptx_bytes = pptx_buf.getvalue()
+
+        # Inject full fonts to replace subset embedded fonts
+        pptx_bytes = inject_full_fonts(pptx_bytes)
 
         # Convert PPTX -> PDF using Aspose.Slides Cloud API (high quality)
-        pdf_bytes = convert_pptx_to_pdf_with_aspose(pptx_buf.getvalue())
+        pdf_bytes = convert_pptx_to_pdf_with_aspose(pptx_bytes)
 
         filename = "sickLeaves.pdf"
         ascii_fallback = "sickLeaves.pdf"
